@@ -7,8 +7,6 @@
 package main
 
 import (
-	"cloud.google.com/go/storage"
-	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -18,6 +16,10 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"cloud.google.com/go/storage"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // errSeeker is returned by ServeContent's sizeFunc when the content
@@ -35,6 +37,7 @@ var errNoOverlap = errors.New("invalid range: failed to overlap")
 // content must be seeked to the beginning of the file.
 // The sizeFunc is called at most once. Its error, if any, is sent in the HTTP response.
 func serveRange(w http.ResponseWriter, r *http.Request, modtime time.Time, size int64, objH *storage.ObjectHandle) {
+	ctx := r.Context()
 	setLastModified(w, modtime)
 	done, rangeReq := checkPreconditions(w, r, modtime)
 	if done {
@@ -79,11 +82,21 @@ func serveRange(w http.ResponseWriter, r *http.Request, modtime time.Time, size 
 		// dumb client. Ignore the range request.
 		ranges = nil
 	}
+
+	// Set range type on the parent span for observability
+	span := trace.SpanFromContext(ctx)
+
 	switch {
 	case len(ranges) == 0:
 		// If-Range check failed or range was otherwise cleared.
 		// Serve the full content so the client can update its cache.
-		if sendContent, err = objH.NewRangeReader(context.Background(), 0, -1); err != nil {
+		span.SetAttributes(attribute.String("range.type", "full_fallback"))
+		var readerSpan trace.Span
+		ctx, readerSpan = tracer.Start(ctx, "gcs.NewRangeReader",
+			trace.WithAttributes(attribute.String("range.type", "full_fallback")))
+		sendContent, err = objH.NewRangeReader(ctx, 0, -1)
+		readerSpan.End()
+		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -100,7 +113,20 @@ func serveRange(w http.ResponseWriter, r *http.Request, modtime time.Time, size 
 		// does not request multiple parts might not support
 		// multipart responses."
 		ra := ranges[0]
-		if sendContent, err = objH.NewRangeReader(context.Background(), ra.start, ra.length); err != nil {
+		span.SetAttributes(
+			attribute.String("range.type", "single"),
+			attribute.Int64("range.start", ra.start),
+			attribute.Int64("range.length", ra.length),
+		)
+		var readerSpan trace.Span
+		ctx, readerSpan = tracer.Start(ctx, "gcs.NewRangeReader",
+			trace.WithAttributes(
+				attribute.Int64("range.start", ra.start),
+				attribute.Int64("range.length", ra.length),
+			))
+		sendContent, err = objH.NewRangeReader(ctx, ra.start, ra.length)
+		readerSpan.End()
+		if err != nil {
 			http.Error(w, err.Error(), http.StatusRequestedRangeNotSatisfiable)
 			return
 		}
@@ -108,6 +134,10 @@ func serveRange(w http.ResponseWriter, r *http.Request, modtime time.Time, size 
 		code = http.StatusPartialContent
 		w.Header().Set("Content-Range", ra.contentRange(size))
 	case len(ranges) > 1:
+		span.SetAttributes(
+			attribute.String("range.type", "multi"),
+			attribute.Int("range.count", len(ranges)),
+		)
 		sendSize = rangesMIMESize(ranges, ctype, size)
 		code = http.StatusPartialContent
 
@@ -124,7 +154,14 @@ func serveRange(w http.ResponseWriter, r *http.Request, modtime time.Time, size 
 					return
 				}
 				var content *storage.Reader
-				if content, err = objH.NewRangeReader(context.Background(), ra.start, ra.length); err != nil {
+				_, readerSpan := tracer.Start(ctx, "gcs.NewRangeReader",
+					trace.WithAttributes(
+						attribute.Int64("range.start", ra.start),
+						attribute.Int64("range.length", ra.length),
+					))
+				content, err = objH.NewRangeReader(ctx, ra.start, ra.length)
+				readerSpan.End()
+				if err != nil {
 					pw.CloseWithError(err)
 					return
 				}
