@@ -38,13 +38,20 @@ func handleError(w http.ResponseWriter, r *http.Request, err error) {
 	logger := zerolog.Ctx(r.Context())
 	span := trace.SpanFromContext(r.Context())
 
-	if errors.Is(err, storage.ErrObjectNotExist) {
+	switch {
+	case errors.Is(err, context.Canceled) && r.Context().Err() != nil:
+		w.WriteHeader(499)
+		logger.Debug().Err(r.Context().Err()).Msg("request context canceled")
+	case errors.Is(err, context.DeadlineExceeded):
+		w.WriteHeader(http.StatusGatewayTimeout)
+		logger.Warn().Err(r.Context().Err()).Msg("request context deadline exceeded")
+	case errors.Is(err, storage.ErrObjectNotExist):
 		logger.Warn().Err(err).Msg("object not found")
 		http.Error(w, err.Error(), http.StatusNotFound)
-	} else {
+	default:
 		span.SetStatus(codes.Error, err.Error())
 		span.RecordError(err)
-		logger.Error().Err(err).Msg("internal error")
+		logger.Error().Err(err).AnErr("ctx_err", r.Context().Err()).Msg("internal error")
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
 }
