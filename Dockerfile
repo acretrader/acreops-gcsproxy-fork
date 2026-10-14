@@ -3,7 +3,7 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -o /gcsproxy .
+RUN CGO_ENABLED=0 go test ./... && CGO_ENABLED=0 go build -o /gcsproxy .
 
 FROM gcr.io/distroless/static-debian12
 COPY --from=build /gcsproxy /gcsproxy

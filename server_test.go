@@ -1,13 +1,16 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"io"
 	"net"
 	"net/http"
+	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -128,5 +131,67 @@ func TestShutdownBoundsHungRequest(t *testing.T) {
 	receive(t, canceled)
 	if err := receive(t, response); err == nil {
 		t.Fatal("hung request unexpectedly completed")
+	}
+}
+
+func TestShutdownWaitsForQueuedResponseBytes(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("blocking TCP linger is Linux-specific")
+	}
+	l := testListener(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	written := make(chan struct{})
+	body := strings.Repeat("queued", 8192)
+	done := make(chan error, 1)
+	go func() {
+		done <- serve(ctx, l, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = io.WriteString(w, body)
+			close(written)
+		}), 2*time.Second)
+	}()
+	dialer := net.Dialer{Control: func(network, address string, raw syscall.RawConn) error {
+		var socketErr error
+		if err := raw.Control(func(fd uintptr) {
+			socketErr = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF, 4096)
+		}); err != nil {
+			return err
+		}
+		return socketErr
+	}}
+	conn, err := dialer.Dial("tcp", l.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if err := conn.SetDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	_, err = io.WriteString(conn, "GET / HTTP/1.1\r\nHost: test\r\n\r\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	receive(t, written)
+	cancel()
+	receive(t, l.closed)
+	select {
+	case err := <-done:
+		t.Fatalf("server exited while response bytes remained unread: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	got, err := io.ReadAll(res.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != body {
+		t.Fatalf("response was truncated: %d bytes", len(got))
+	}
+	if err := receive(t, done); err != nil {
+		t.Fatal(err)
 	}
 }

@@ -12,7 +12,20 @@ import (
 )
 
 func serve(ctx context.Context, listener net.Listener, handler http.Handler, grace time.Duration) error {
-	server := &http.Server{Handler: handler}
+	logger := zerolog.Ctx(ctx)
+	server := &http.Server{
+		Handler: handler,
+		ConnContext: func(connCtx context.Context, conn net.Conn) context.Context {
+			// A completed HTTP write may still have bytes in the kernel send queue.
+			// On Linux, linger makes Close wait for delivery before Pod networking disappears.
+			if tcp, ok := conn.(*net.TCPConn); ok {
+				if err := tcp.SetLinger(2); err != nil {
+					logger.Error().Err(err).Msg("cannot enable TCP response drain")
+				}
+			}
+			return connCtx
+		},
+	}
 	done := make(chan error, 1)
 	go func() { done <- server.Serve(listener) }()
 
@@ -23,7 +36,6 @@ func serve(ctx context.Context, listener net.Listener, handler http.Handler, gra
 	}
 
 	started := time.Now()
-	logger := zerolog.Ctx(ctx)
 	logger.Info().Msg("draining active HTTP requests")
 	// Do not use the canceled signal context for active requests or their drain.
 	drainCtx, cancel := context.WithTimeout(context.Background(), grace)
