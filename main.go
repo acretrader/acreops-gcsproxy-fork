@@ -6,12 +6,15 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"runtime/debug"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"cloud.google.com/go/storage"
@@ -297,7 +300,13 @@ func main() {
 	if err != nil {
 		baseLogger.Fatal().Err(err).Msg("failed to initialize telemetry")
 	}
-	defer shutdown(ctx)
+	defer func() {
+		flushCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := shutdown(flushCtx); err != nil {
+			baseLogger.Warn().Err(err).Msg("telemetry shutdown failed")
+		}
+	}()
 
 	// GCS client
 	if *credentials != "" {
@@ -308,6 +317,7 @@ func main() {
 	if err != nil {
 		baseLogger.Fatal().Err(err).Msg("failed to create GCS client")
 	}
+	defer client.Close()
 
 	// Router
 	r := mux.NewRouter()
@@ -319,8 +329,14 @@ func main() {
 	r.HandleFunc("/_health", wrapper(healthCheck, baseLogger)).Methods("GET", "HEAD")
 	r.HandleFunc("/{bucket:[0-9a-zA-Z-_.]+}/{object:.*}", wrapper(proxy, baseLogger)).Methods("GET", "HEAD")
 
+	listener, err := net.Listen("tcp", *bind)
+	if err != nil {
+		baseLogger.Fatal().Err(err).Msg("failed to listen")
+	}
+	stopCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 	baseLogger.Info().Str("bind", *bind).Msg("listening")
-	if err := http.ListenAndServe(*bind, r); err != nil {
+	if err := serve(baseLogger.WithContext(stopCtx), listener, r, 25*time.Second); err != nil {
 		baseLogger.Fatal().Err(err).Msg("server failed")
 	}
 }
