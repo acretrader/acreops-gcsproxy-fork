@@ -6,28 +6,48 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/rs/zerolog"
 )
 
+type drainingListener struct{ net.Listener }
+
+func (l drainingListener) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	if tcp, ok := conn.(*net.TCPConn); ok {
+		// Wait for queued response bytes before Pod networking disappears.
+		if err := tcp.SetLinger(2); err != nil {
+			_ = tcp.Close()
+			return nil, fmt.Errorf("enable TCP response drain: %w", err)
+		}
+		return &drainingConn{TCPConn: tcp}, nil
+	}
+	return conn, nil
+}
+
+type drainingConn struct {
+	*net.TCPConn
+	closeOnce sync.Once
+	closeErr  error
+}
+
+func (c *drainingConn) Close() error {
+	// net/http can close an idle connection while its serving goroutine is
+	// already closing it. Both callers must wait for the same TCP drain.
+	c.closeOnce.Do(func() { c.closeErr = c.TCPConn.Close() })
+	return c.closeErr
+}
+
 func serve(ctx context.Context, listener net.Listener, handler http.Handler, grace time.Duration) error {
 	logger := zerolog.Ctx(ctx)
-	server := &http.Server{
-		Handler: handler,
-		ConnContext: func(connCtx context.Context, conn net.Conn) context.Context {
-			// A completed HTTP write may still have bytes in the kernel send queue.
-			// On Linux, linger makes Close wait for delivery before Pod networking disappears.
-			if tcp, ok := conn.(*net.TCPConn); ok {
-				if err := tcp.SetLinger(2); err != nil {
-					logger.Error().Err(err).Msg("cannot enable TCP response drain")
-				}
-			}
-			return connCtx
-		},
-	}
+	server := &http.Server{Handler: handler}
 	done := make(chan error, 1)
-	go func() { done <- server.Serve(listener) }()
+	go func() { done <- server.Serve(drainingListener{listener}) }()
 
 	select {
 	case err := <-done:

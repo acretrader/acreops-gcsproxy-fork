@@ -142,12 +142,17 @@ func TestShutdownWaitsForQueuedResponseBytes(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	written := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	finish := func() { releaseOnce.Do(func() { close(release) }) }
+	defer finish()
 	body := strings.Repeat("queued", 8192)
 	done := make(chan error, 1)
 	go func() {
 		done <- serve(ctx, l, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			_, _ = io.WriteString(w, body)
 			close(written)
+			<-release
 		}), 2*time.Second)
 	}()
 	dialer := net.Dialer{Control: func(network, address string, raw syscall.RawConn) error {
@@ -179,6 +184,7 @@ func TestShutdownWaitsForQueuedResponseBytes(t *testing.T) {
 	receive(t, written)
 	cancel()
 	receive(t, l.closed)
+	finish()
 	select {
 	case err := <-done:
 		t.Fatalf("server exited while response bytes remained unread: %v", err)
