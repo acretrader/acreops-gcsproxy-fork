@@ -1,12 +1,12 @@
-FROM golang:1.26.10-bookworm@sha256:23ce71337b726608afb1bc00986e630a05034a87a87ea1fc2cd1ae5cf33387eb AS build
+FROM golang:1.26.10-alpine@sha256:a2012b4a1d1f9f7e9f44e0d39b805a901e856b1dd80b4e6ee4338db547050308 AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 go test ./... && CGO_ENABLED=0 go build -o /gcsproxy .
 
-FROM cgr.dev/chainguard/wolfi-base@sha256:629d9acaceda7746cd9293365eb0d8e8fabf74e91830b05470cfbee20b53f447
-RUN apk upgrade --no-cache
+FROM alpine:3.24@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a
+RUN apk add --no-cache ca-certificates
 COPY --from=build /gcsproxy /gcsproxy
 ENTRYPOINT ["/gcsproxy"]
 CMD ["-b", "0.0.0.0:8080"]
